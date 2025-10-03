@@ -128,10 +128,10 @@
                                 return reject(new Error('Could not get canvas context for drawing.'));
                             }
 
-                            // --- AGGRESSIVE COMPRESSION SETTINGS ---
-                            const MAX_SIZE = 500; // Max width or height in pixels (Further reduced for maximum speed)
-                            const JPEG_QUALITY = 0.5; // JPEG compression quality (Drastically reduced for maximum speed and size reduction)
-                            // --- END AGGRESSIVE COMPRESSION SETTINGS ---
+                            // --- EXTREME COMPRESSION SETTINGS FOR STABILITY ---
+                            const MAX_SIZE = 500; // Max width or height in pixels (Low resolution for speed)
+                            const JPEG_QUALITY = 0.25; // JPEG compression quality (DRASITCALLY CUT TO 25%)
+                            // --- END EXTREME COMPRESSION SETTINGS ---
                             
                             let width = img.width;
                             let height = img.height;
