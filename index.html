@@ -105,14 +105,14 @@
         };
 
         // --- Main-Thread Logic for Image Compression with Timeout ---
-        const compressImageMainThread = (file, timeoutMs = 10000) => {
+        const compressImageMainThread = (file, timeoutMs = 20000) => {
             return new Promise((resolve, reject) => {
                 const reader = new FileReader();
                 let img = null;
                 
-                // --- Safety Timeout ---
+                // --- Safety Timeout (20 seconds now) ---
                 const timeout = setTimeout(() => {
-                    reject(new Error("Image processing timed out (Exceeded 10 seconds). The file is too large for fast in-browser processing."));
+                    reject(new Error("Image processing timed out (Exceeded 20 seconds). The file is too large for fast in-browser processing."));
                 }, timeoutMs);
 
                 reader.onload = (readerEvent) => {
@@ -130,7 +130,7 @@
 
                             // --- EXTREME COMPRESSION SETTINGS FOR STABILITY ---
                             const MAX_SIZE = 500; // Max width or height in pixels (Low resolution for speed)
-                            const JPEG_QUALITY = 0.25; // JPEG compression quality (DRASITCALLY CUT TO 25%)
+                            const JPEG_QUALITY = 0.1; // JPEG compression quality (DRASITCALLY CUT TO 10%)
                             // --- END EXTREME COMPRESSION SETTINGS ---
                             
                             let width = img.width;
