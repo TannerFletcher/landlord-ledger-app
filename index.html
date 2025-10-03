@@ -107,77 +107,72 @@
 
         // --- WEB WORKER IMPLEMENTATION (OFF-MAIN-THREAD PROCESSING) ---
 
-        // 1. Worker Script Content (Handles all heavy lifting)
+        // 1. Worker Script Content (Handles all heavy lifting using worker-safe APIs)
         const workerScript = `
-            self.onmessage = (e) => {
+            self.onmessage = async (e) => {
                 const { file, MAX_SIZE, JPEG_QUALITY, timeoutMs } = e.data;
                 
-                // Set up a worker-side timeout, although main thread handles promise rejection
-                const timeout = setTimeout(() => {
-                     self.postMessage({ error: true, message: "Worker timed out processing image." });
-                }, timeoutMs);
+                let timeoutHandle = null;
 
-                const reader = new FileReader();
+                try {
+                    // 1. Worker-side Timeout Setup
+                    timeoutHandle = setTimeout(() => {
+                         self.postMessage({ error: true, message: "Worker timed out processing image (Exceeded 30 seconds)." });
+                    }, timeoutMs);
 
-                reader.onload = (readerEvent) => {
-                    const img = new Image();
+                    // 2. Decode the image using worker-safe API: createImageBitmap
+                    // This is the CRITICAL change, avoiding the DOM-based new Image() constructor.
+                    const imageBitmap = await createImageBitmap(file);
                     
-                    img.onload = () => {
-                        clearTimeout(timeout); 
-                        try {
-                            const canvas = new OffscreenCanvas(1, 1); // Use OffscreenCanvas if available, falls back to Canvas in worker
-                            const ctx = canvas.getContext('2d');
-                            
-                            if (!ctx) {
-                                return self.postMessage({ error: true, message: 'Could not get canvas context.' });
-                            }
+                    clearTimeout(timeoutHandle); // Clear timeout since decoding is complete
 
-                            let width = img.width;
-                            let height = img.height;
+                    // 3. Setup Canvas for Drawing using OffscreenCanvas (worker-safe)
+                    const canvas = new OffscreenCanvas(1, 1);
+                    const ctx = canvas.getContext('2d');
+                    
+                    if (!ctx) {
+                        throw new Error('Could not get canvas context.');
+                    }
 
-                            // Resizing logic (Scale down to fit MAX_SIZE)
-                            if (width > height) {
-                                if (width > MAX_SIZE) {
-                                    height *= MAX_SIZE / width;
-                                    width = MAX_SIZE;
-                                }
-                            } else {
-                                if (height > MAX_SIZE) {
-                                    width *= MAX_SIZE / height;
-                                    height = MAX_SIZE;
-                                }
-                            }
+                    let width = imageBitmap.width;
+                    let height = imageBitmap.height;
 
-                            canvas.width = width;
-                            canvas.height = height;
-                            
-                            // Draw image to canvas and compress
-                            ctx.drawImage(img, 0, 0, width, height);
-                            // NOTE: toDataURL is synchronous but runs safely off the main thread here
-                            const compressedDataUrl = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
-                            
-                            self.postMessage({ success: true, dataUrl: compressedDataUrl });
-
-                        } catch (e) {
-                            self.postMessage({ error: true, message: 'Image processing failed: ' + e.message });
+                    // 4. Resizing logic (Scale down to fit MAX_SIZE)
+                    if (width > height) {
+                        if (width > MAX_SIZE) {
+                            height *= MAX_SIZE / width;
+                            width = MAX_SIZE;
                         }
-                    };
-                    
-                    img.onerror = () => {
-                         clearTimeout(timeout); 
-                         self.postMessage({ error: true, message: 'Image failed to load in worker.' });
-                    };
-                    
-                    img.src = readerEvent.target.result;
-                };
+                    } else {
+                        if (height > MAX_SIZE) {
+                            width *= MAX_SIZE / height;
+                            height = MAX_SIZE;
+                        }
+                    }
 
-                reader.onerror = (error) => {
-                    clearTimeout(timeout);
-                    self.postMessage({ error: true, message: 'FileReader failed to read file in worker.' });
-                };
-                
-                // Read the file data. The actual decoding and drawing is now safe
-                reader.readAsDataURL(file);
+                    canvas.width = width;
+                    canvas.height = height;
+                    
+                    // 5. Draw and Compress
+                    ctx.drawImage(imageBitmap, 0, 0, width, height);
+                    
+                    // Convert OffscreenCanvas content to a Blob asynchronously (worker-safe)
+                    const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: JPEG_QUALITY });
+                    
+                    // 6. Convert final Blob to DataURL for storage
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        self.postMessage({ success: true, dataUrl: e.target.result });
+                    };
+                    reader.onerror = () => {
+                        self.postMessage({ error: true, message: "Failed to read compressed image blob." });
+                    };
+                    reader.readAsDataURL(blob);
+
+                } catch (e) {
+                    if (timeoutHandle) clearTimeout(timeoutHandle);
+                    self.postMessage({ error: true, message: 'Image processing failed: ' + e.message });
+                }
             };
         `;
 
@@ -199,7 +194,7 @@
                 const timeout = setTimeout(() => {
                     if (!isComplete) {
                         worker.terminate();
-                        reject(new Error("Image processing timed out (Exceeded 30 seconds). The file is too large or corrupted."));
+                        reject(new Error("Image processing timed out (Exceeded 30 seconds). The file might be corrupted."));
                     }
                 }, timeoutMs);
 
@@ -208,6 +203,9 @@
                     clearTimeout(timeout);
                     worker.terminate(); // Kill worker after job is done
                     
+                    // Revoke the object URL to clean up memory
+                    URL.revokeObjectURL(workerUrl); 
+
                     if (e.data.success) {
                         resolve(e.data.dataUrl);
                     } else if (e.data.error) {
@@ -220,10 +218,11 @@
                 worker.onerror = (error) => {
                     isComplete = true;
                     clearTimeout(timeout);
+                    URL.revokeObjectURL(workerUrl);
                     reject(new Error('Worker encountered a fatal error: ' + error.message));
                 };
 
-                // Start the work in the worker thread
+                // Start the work in the worker thread by transferring the File object
                 worker.postMessage({ file, MAX_SIZE, JPEG_QUALITY, timeoutMs });
             });
         };
@@ -299,17 +298,10 @@
                     return;
                 }
                 
-                // Max size check for the raw file before processing (4MB safety limit)
-                const MAX_SIZE_BYTES_RAW = 4 * 1024 * 1024; 
-                if (file.size > MAX_SIZE_BYTES_RAW) {
-                    // This warning remains but the worker should handle the large file safely
-                    console.warn("Initial photo file size is large. Processing started in Web Worker.");
-                }
-                
                 try {
                     const timestamp = new Date().toLocaleString();
                     
-                    // CALLING THE NEW WEB WORKER FUNCTION
+                    // CALLING THE WEB WORKER FUNCTION (runs safely off-thread)
                     const dataUrl = await compressImageWorker(file); 
 
                     const newPhoto = {
@@ -320,7 +312,7 @@
                     handleUpdate('photos', [...room.photos, newPhoto]);
                 } catch (error) {
                     console.error("Critical Image Processing Error:", error);
-                    window.alert(`Could not process image. Error: ${error.message}. The image might still be too large or the processing failed.`);
+                    window.alert(`Could not process image. Error: ${error.message}. The processing was cancelled or failed.`);
                 } finally {
                     // CRITICAL: Ensure the loading spinner stops
                     setIsCapturing(false);
