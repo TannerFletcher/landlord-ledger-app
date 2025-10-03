@@ -85,7 +85,6 @@
         
         // --- Utility Functions ---
         
-        // Load data from localStorage
         const loadData = () => {
             try {
                 const storedData = localStorage.getItem(STORAGE_KEY);
@@ -96,7 +95,6 @@
             }
         };
 
-        // Save data to localStorage
         const saveData = (data) => {
             try {
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
@@ -106,32 +104,21 @@
             }
         };
 
-        // 1. Quick file to Base64 on the main thread (fast operation)
-        const fileToBase64 = (file) => {
-            return new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.readAsDataURL(file);
-                reader.onload = () => resolve(reader.result);
-                reader.onerror = error => {
-                    console.error("FileReader error:", error);
-                    reject("File reading failed."); 
-                };
-            });
-        };
+        // --- Web Worker Logic for Image Compression (Heavy lifting off-main thread) ---
+        // We pass an Object URL instead of a Base64 string for memory efficiency.
 
-        // --- Web Worker Logic for Image Compression (Heavy lifting moves off-main thread) ---
-
-        const compressImageWorker = (base64Data, quality = 0.75) => {
+        const compressImageWorker = (objectUrl, quality = 0.75) => {
             return new Promise((resolve, reject) => {
                 // Inline worker code defined as a string
                 const workerScript = `
                     self.onmessage = function(e) {
-                        const { base64Data, quality } = e.data;
+                        const { objectUrl, quality } = e.data;
 
                         const img = new Image();
+                        
                         img.onload = () => {
                             try {
-                                const canvas = document.createElement('canvas');
+                                const canvas = new OffscreenCanvas(1, 1); // Use OffscreenCanvas for better worker performance
                                 const ctx = canvas.getContext('2d');
                                 
                                 const MAX_SIZE = 1000; 
@@ -152,20 +139,29 @@
 
                                 canvas.width = width;
                                 canvas.height = height;
+                                
+                                // Draw image to canvas for compression
                                 ctx.drawImage(img, 0, 0, width, height);
                                 
+                                // Export compressed JPEG
+                                // We use 'canvas.convertToBlob' and then read it, but for simplicity we revert 
+                                // to toDataURL as canvas.toDataURL is supported inside basic workers.
                                 const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
+                                
                                 self.postMessage({ success: true, dataUrl: compressedDataUrl });
                             } catch (e) {
-                                self.postMessage({ success: false, error: 'Compression error in worker.' });
+                                console.error("Worker Compression Error:", e);
+                                self.postMessage({ success: false, error: 'Compression failed during image processing in worker.' });
                             }
                         };
                         
                         img.onerror = () => {
-                            self.postMessage({ success: false, error: 'Image failed to load in worker.' });
+                            // This is the critical failure point for massive images.
+                            self.postMessage({ success: false, error: 'Image failed to load from object URL in worker.' });
                         };
                         
-                        img.src = base64Data;
+                        // Load image from the efficient Object URL
+                        img.src = objectUrl;
                     };
                 `;
 
@@ -176,7 +172,7 @@
 
                 worker.onmessage = (e) => {
                     worker.terminate(); // Terminate the worker once done
-                    URL.revokeObjectURL(workerUrl); // Clean up the URL
+                    URL.revokeObjectURL(workerUrl); // Clean up the URL used for the worker script
                     if (e.data.success) {
                         resolve(e.data.dataUrl);
                     } else {
@@ -187,12 +183,12 @@
                 worker.onerror = (error) => {
                     worker.terminate();
                     URL.revokeObjectURL(workerUrl);
-                    console.error("Worker error:", error);
-                    reject('Worker failed to execute compression.');
+                    console.error("Worker Execution Error:", error);
+                    reject('Worker failed to execute compression task.');
                 };
 
-                // Start the worker by posting the data
-                worker.postMessage({ base64Data, quality });
+                // Start the worker by posting the Object URL
+                worker.postMessage({ objectUrl, quality });
             });
         };
 
@@ -262,16 +258,16 @@
                     return;
                 }
                 
+                let objectUrl = null;
                 try {
                     // 1. Get current timestamp
                     const timestamp = new Date().toLocaleString();
                     
-                    // 2. Convert raw file to Base64 (Main thread, fast)
-                    const rawDataUrl = await fileToBase64(file);
+                    // 2. Create Object URL on the main thread (EXTREMELY fast operation)
+                    objectUrl = URL.createObjectURL(file);
 
-                    // 3. Compress and resize the image (Background Web Worker, safe)
-                    // Note: We are now calling the Worker wrapper function instead of the direct compression logic
-                    const dataUrl = await compressImageWorker(rawDataUrl); 
+                    // 3. Compress and resize the image (Background Web Worker, using the pointer URL)
+                    const dataUrl = await compressImageWorker(objectUrl); 
 
                     // 4. Create new Photo Object
                     const newPhoto = {
@@ -281,14 +277,18 @@
 
                     handleUpdate('photos', [...room.photos, newPhoto]);
                 } catch (error) {
-                    // Catch block for any failure in the async chain (fileToBase64 or compressImageWorker)
+                    // Catch block for any failure
                     console.error("Critical Image Processing Error:", error);
-                    // Pass a simplified message to the user
-                    window.alert(`Could not process image: ${typeof error === 'string' ? error : 'A critical system error occurred during processing'}. Try capturing a photo again.`);
+                    // Provide a generic, user-friendly error message
+                    window.alert(`Could not process image: ${typeof error === 'string' ? error : 'A critical processing error occurred'}. The file might be corrupted or too large to decode.`);
+                } finally {
+                    // CRITICAL: Revoke the Object URL to free up the memory immediately
+                    if (objectUrl) {
+                        URL.revokeObjectURL(objectUrl);
+                    }
+                    setIsCapturing(false);
+                    event.target.value = null; // Clear input
                 }
-
-                setIsCapturing(false);
-                event.target.value = null; // Clear input
             };
 
             const handleDeleteRoom = async (e) => {
