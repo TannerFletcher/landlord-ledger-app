@@ -105,7 +105,7 @@
         };
 
         // --- Web Worker Logic for Image Compression (Heavy lifting off-main thread) ---
-        // We pass an Object URL instead of a Base64 string for memory efficiency.
+        // Uses Object URL transfer and includes aggressive error handling/timeouts inside the worker.
 
         const compressImageWorker = (objectUrl, quality = 0.75) => {
             return new Promise((resolve, reject) => {
@@ -113,18 +113,29 @@
                 const workerScript = `
                     self.onmessage = function(e) {
                         const { objectUrl, quality } = e.data;
-
                         const img = new Image();
+
+                        // Add a safety timeout in case onload never fires (which means memory crash during decoding)
+                        const timeout = setTimeout(() => {
+                            self.postMessage({ success: false, error: 'Image load timed out (10s) in worker. File is likely too large to decode even in the background thread.' });
+                        }, 10000); 
                         
                         img.onload = () => {
+                            clearTimeout(timeout); // Clear timeout on successful load
                             try {
-                                const canvas = new OffscreenCanvas(1, 1); // Use OffscreenCanvas for better worker performance
+                                // Standard canvas creation and context retrieval
+                                const canvas = document.createElement('canvas');
                                 const ctx = canvas.getContext('2d');
                                 
+                                if (!ctx) {
+                                    throw new Error('Could not get canvas context in worker for drawing.');
+                                }
+
                                 const MAX_SIZE = 1000; 
                                 let width = img.width;
                                 let height = img.height;
 
+                                // Resizing logic
                                 if (width > height) {
                                     if (width > MAX_SIZE) {
                                         height *= MAX_SIZE / width;
@@ -144,20 +155,19 @@
                                 ctx.drawImage(img, 0, 0, width, height);
                                 
                                 // Export compressed JPEG
-                                // We use 'canvas.convertToBlob' and then read it, but for simplicity we revert 
-                                // to toDataURL as canvas.toDataURL is supported inside basic workers.
                                 const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
                                 
                                 self.postMessage({ success: true, dataUrl: compressedDataUrl });
                             } catch (e) {
-                                console.error("Worker Compression Error:", e);
-                                self.postMessage({ success: false, error: 'Compression failed during image processing in worker.' });
+                                // Failure during canvas/drawing stage
+                                self.postMessage({ success: false, error: 'Compression/Drawing failed inside worker: ' + e.message });
                             }
                         };
                         
                         img.onerror = () => {
-                            // This is the critical failure point for massive images.
-                            self.postMessage({ success: false, error: 'Image failed to load from object URL in worker.' });
+                            clearTimeout(timeout); // Clear timeout on error
+                            // Failure during initial image loading from URL
+                            self.postMessage({ success: false, error: 'Image failed to load from Object URL in worker (corrupt file or data issue).' });
                         };
                         
                         // Load image from the efficient Object URL
@@ -176,15 +186,17 @@
                     if (e.data.success) {
                         resolve(e.data.dataUrl);
                     } else {
-                        reject(e.data.error);
+                        // This catch block handles the error messages passed from inside the worker
+                        reject(e.data.error); 
                     }
                 };
 
                 worker.onerror = (error) => {
                     worker.terminate();
                     URL.revokeObjectURL(workerUrl);
-                    console.error("Worker Execution Error:", error);
-                    reject('Worker failed to execute compression task.');
+                    console.error("Worker Execution Error (Top Level):", error);
+                    // This error means the worker script itself failed to run
+                    reject('Worker failed to initialize the compression script.');
                 };
 
                 // Start the worker by posting the Object URL
@@ -266,7 +278,7 @@
                     // 2. Create Object URL on the main thread (EXTREMELY fast operation)
                     objectUrl = URL.createObjectURL(file);
 
-                    // 3. Compress and resize the image (Background Web Worker, using the pointer URL)
+                    // 3. Compress and resize the image (Background Web Worker)
                     const dataUrl = await compressImageWorker(objectUrl); 
 
                     // 4. Create new Photo Object
@@ -277,10 +289,9 @@
 
                     handleUpdate('photos', [...room.photos, newPhoto]);
                 } catch (error) {
-                    // Catch block for any failure
+                    // Catch block for any failure - the error message now comes directly from the worker
                     console.error("Critical Image Processing Error:", error);
-                    // Provide a generic, user-friendly error message
-                    window.alert(`Could not process image: ${typeof error === 'string' ? error : 'A critical processing error occurred'}. The file might be corrupted or too large to decode.`);
+                    window.alert(`Could not process image. Error: ${error}. Try capturing a lower resolution photo.`);
                 } finally {
                     // CRITICAL: Revoke the Object URL to free up the memory immediately
                     if (objectUrl) {
