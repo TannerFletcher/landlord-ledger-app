@@ -104,15 +104,22 @@
             }
         };
 
-        // --- Main-Thread Logic for Image Compression (Reverting from Worker due to sandbox restrictions) ---
-        const compressImageMainThread = (file, quality = 0.75) => {
+        // --- Main-Thread Logic for Image Compression with Timeout ---
+        const compressImageMainThread = (file, timeoutMs = 10000) => {
             return new Promise((resolve, reject) => {
                 const reader = new FileReader();
+                let img = null;
+                
+                // --- Safety Timeout ---
+                const timeout = setTimeout(() => {
+                    reject(new Error("Image processing timed out (Exceeded 10 seconds). The file is too large for fast in-browser processing."));
+                }, timeoutMs);
 
                 reader.onload = (readerEvent) => {
-                    const img = new Image();
+                    img = new Image();
                     
                     img.onload = () => {
+                        clearTimeout(timeout); // SUCCESS: Clear timeout
                         try {
                             const canvas = document.createElement('canvas');
                             const ctx = canvas.getContext('2d');
@@ -121,7 +128,11 @@
                                 return reject(new Error('Could not get canvas context for drawing.'));
                             }
 
-                            const MAX_SIZE = 1000; // Max width or height in pixels
+                            // --- AGGRESSIVE COMPRESSION SETTINGS ---
+                            const MAX_SIZE = 600; // Max width or height in pixels (Reduced for speed)
+                            const JPEG_QUALITY = 0.6; // JPEG compression quality (Reduced for speed and size)
+                            // --- END AGGRESSIVE COMPRESSION SETTINGS ---
+                            
                             let width = img.width;
                             let height = img.height;
 
@@ -143,7 +154,7 @@
                             
                             // Draw image to canvas and compress
                             ctx.drawImage(img, 0, 0, width, height);
-                            const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
+                            const compressedDataUrl = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
                             
                             resolve(compressedDataUrl);
 
@@ -153,14 +164,18 @@
                     };
                     
                     img.onerror = () => {
+                         clearTimeout(timeout); // ERROR: Clear timeout
                          reject(new Error('Image failed to load from FileReader result (possibly corrupted).'));
                     };
                     
-                    // Start loading the image data
+                    // Start loading the image data (this is the potentially slow step)
                     img.src = readerEvent.target.result;
                 };
 
-                reader.onerror = (error) => reject(new Error('FileReader failed to read file.'));
+                reader.onerror = (error) => {
+                    clearTimeout(timeout); // ERROR: Clear timeout
+                    reject(new Error('FileReader failed to read file.'));
+                };
                 
                 // Read the file into memory as a Data URL
                 reader.readAsDataURL(file);
@@ -231,6 +246,7 @@
                         "**Quick Fix on iPhone:** Go to Settings -> Camera -> Formats, and select 'Most Compatible' (JPEG). \n\n" +
                         "Then try capturing the photo again."
                     );
+                    // CRITICAL: Ensure the loading spinner stops and input is cleared
                     setIsCapturing(false);
                     event.target.value = null; 
                     return;
@@ -240,6 +256,7 @@
                 const MAX_SIZE_BYTES_RAW = 4 * 1024 * 1024; 
                 if (file.size > MAX_SIZE_BYTES_RAW) {
                     window.alert("Initial photo file too large (over 4MB). Please use a lower resolution photo.");
+                    // CRITICAL: Ensure the loading spinner stops and input is cleared
                     setIsCapturing(false);
                     event.target.value = null; 
                     return;
@@ -248,7 +265,7 @@
                 try {
                     const timestamp = new Date().toLocaleString();
                     
-                    // *** Call the main-thread processing function ***
+                    // Call the main-thread processing function with the safety timeout
                     const dataUrl = await compressImageMainThread(file); 
 
                     const newPhoto = {
@@ -258,10 +275,10 @@
 
                     handleUpdate('photos', [...room.photos, newPhoto]);
                 } catch (error) {
-                    // This error now catches issues in the main-thread canvas processing
                     console.error("Critical Image Processing Error:", error);
-                    window.alert(`Could not process image. Error: ${error.message}. Try capturing a different photo or check your file type.`);
+                    window.alert(`Could not process image. Error: ${error.message}. The image might still be too large or the processing timed out.`);
                 } finally {
+                    // CRITICAL: Ensure the loading spinner stops
                     setIsCapturing(false);
                     event.target.value = null; // Clear input
                 }
