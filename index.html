@@ -104,35 +104,34 @@
             }
         };
 
-        // --- Main-Thread Logic for Image Compression with Timeout ---
-        const compressImageMainThread = (file, timeoutMs = 20000) => {
-            return new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                let img = null;
+
+        // --- WEB WORKER IMPLEMENTATION (OFF-MAIN-THREAD PROCESSING) ---
+
+        // 1. Worker Script Content (Handles all heavy lifting)
+        const workerScript = `
+            self.onmessage = (e) => {
+                const { file, MAX_SIZE, JPEG_QUALITY, timeoutMs } = e.data;
                 
-                // --- Safety Timeout (20 seconds now) ---
+                // Set up a worker-side timeout, although main thread handles promise rejection
                 const timeout = setTimeout(() => {
-                    reject(new Error("Image processing timed out (Exceeded 20 seconds). The file is too large for fast in-browser processing."));
+                     self.postMessage({ error: true, message: "Worker timed out processing image." });
                 }, timeoutMs);
 
+                const reader = new FileReader();
+
                 reader.onload = (readerEvent) => {
-                    img = new Image();
+                    const img = new Image();
                     
                     img.onload = () => {
-                        clearTimeout(timeout); // SUCCESS: Clear timeout
+                        clearTimeout(timeout); 
                         try {
-                            const canvas = document.createElement('canvas');
+                            const canvas = new OffscreenCanvas(1, 1); // Use OffscreenCanvas if available, falls back to Canvas in worker
                             const ctx = canvas.getContext('2d');
                             
                             if (!ctx) {
-                                return reject(new Error('Could not get canvas context for drawing.'));
+                                return self.postMessage({ error: true, message: 'Could not get canvas context.' });
                             }
 
-                            // --- EXTREME COMPRESSION SETTINGS FOR STABILITY ---
-                            const MAX_SIZE = 500; // Max width or height in pixels (Low resolution for speed)
-                            const JPEG_QUALITY = 0.1; // JPEG compression quality (DRASITCALLY CUT TO 10%)
-                            // --- END EXTREME COMPRESSION SETTINGS ---
-                            
                             let width = img.width;
                             let height = img.height;
 
@@ -154,33 +153,81 @@
                             
                             // Draw image to canvas and compress
                             ctx.drawImage(img, 0, 0, width, height);
+                            // NOTE: toDataURL is synchronous but runs safely off the main thread here
                             const compressedDataUrl = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
                             
-                            resolve(compressedDataUrl);
+                            self.postMessage({ success: true, dataUrl: compressedDataUrl });
 
                         } catch (e) {
-                            reject(new Error('Image processing failed during drawing/compression: ' + e.message));
+                            self.postMessage({ error: true, message: 'Image processing failed: ' + e.message });
                         }
                     };
                     
                     img.onerror = () => {
-                         clearTimeout(timeout); // ERROR: Clear timeout
-                         reject(new Error('Image failed to load from FileReader result (possibly corrupted).'));
+                         clearTimeout(timeout); 
+                         self.postMessage({ error: true, message: 'Image failed to load in worker.' });
                     };
                     
-                    // Start loading the image data (this is the potentially slow step)
                     img.src = readerEvent.target.result;
                 };
 
                 reader.onerror = (error) => {
-                    clearTimeout(timeout); // ERROR: Clear timeout
-                    reject(new Error('FileReader failed to read file.'));
+                    clearTimeout(timeout);
+                    self.postMessage({ error: true, message: 'FileReader failed to read file in worker.' });
                 };
                 
-                // Read the file into memory as a Data URL
+                // Read the file data. The actual decoding and drawing is now safe
                 reader.readAsDataURL(file);
+            };
+        `;
+
+        // 2. Worker setup and promise-based interface
+        const compressImageWorker = (file) => {
+            return new Promise((resolve, reject) => {
+                const timeoutMs = 30000; // 30 seconds for off-thread processing
+                const MAX_SIZE = 500;
+                const JPEG_QUALITY = 0.1; // Still using 10% for maximum stability
+
+                // Create the worker from the inline script blob
+                const blob = new Blob([workerScript], { type: 'application/javascript' });
+                const workerUrl = URL.createObjectURL(blob);
+                const worker = new Worker(workerUrl);
+                
+                let isComplete = false;
+
+                // Main thread timeout handler (in case the worker itself locks up)
+                const timeout = setTimeout(() => {
+                    if (!isComplete) {
+                        worker.terminate();
+                        reject(new Error("Image processing timed out (Exceeded 30 seconds). The file is too large or corrupted."));
+                    }
+                }, timeoutMs);
+
+                worker.onmessage = (e) => {
+                    isComplete = true;
+                    clearTimeout(timeout);
+                    worker.terminate(); // Kill worker after job is done
+                    
+                    if (e.data.success) {
+                        resolve(e.data.dataUrl);
+                    } else if (e.data.error) {
+                        reject(new Error(e.data.message));
+                    } else {
+                        reject(new Error("Unknown worker error occurred."));
+                    }
+                };
+
+                worker.onerror = (error) => {
+                    isComplete = true;
+                    clearTimeout(timeout);
+                    reject(new Error('Worker encountered a fatal error: ' + error.message));
+                };
+
+                // Start the work in the worker thread
+                worker.postMessage({ file, MAX_SIZE, JPEG_QUALITY, timeoutMs });
             });
         };
+        // --- END WEB WORKER IMPLEMENTATION ---
 
 
         // --- Icon Components ---
@@ -255,18 +302,15 @@
                 // Max size check for the raw file before processing (4MB safety limit)
                 const MAX_SIZE_BYTES_RAW = 4 * 1024 * 1024; 
                 if (file.size > MAX_SIZE_BYTES_RAW) {
-                    window.alert("Initial photo file too large (over 4MB). Please use a lower resolution photo.");
-                    // CRITICAL: Ensure the loading spinner stops and input is cleared
-                    setIsCapturing(false);
-                    event.target.value = null; 
-                    return;
+                    // This warning remains but the worker should handle the large file safely
+                    console.warn("Initial photo file size is large. Processing started in Web Worker.");
                 }
                 
                 try {
                     const timestamp = new Date().toLocaleString();
                     
-                    // Call the main-thread processing function with the safety timeout
-                    const dataUrl = await compressImageMainThread(file); 
+                    // CALLING THE NEW WEB WORKER FUNCTION
+                    const dataUrl = await compressImageWorker(file); 
 
                     const newPhoto = {
                         dataUrl,
@@ -276,7 +320,7 @@
                     handleUpdate('photos', [...room.photos, newPhoto]);
                 } catch (error) {
                     console.error("Critical Image Processing Error:", error);
-                    window.alert(`Could not process image. Error: ${error.message}. The image might still be too large or the processing timed out.`);
+                    window.alert(`Could not process image. Error: ${error.message}. The image might still be too large or the processing failed.`);
                 } finally {
                     // CRITICAL: Ensure the loading spinner stops
                     setIsCapturing(false);
