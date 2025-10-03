@@ -104,92 +104,66 @@
             }
         };
 
-        // --- Web Worker Logic for Image Compression ---
-        const compressImageWorker = (objectUrl, quality = 0.75) => {
+        // --- Main-Thread Logic for Image Compression (Reverting from Worker due to sandbox restrictions) ---
+        const compressImageMainThread = (file, quality = 0.75) => {
             return new Promise((resolve, reject) => {
-                const workerScript = `
-                    self.onmessage = function(e) {
-                        const { objectUrl, quality } = e.data;
-                        const img = new Image();
+                const reader = new FileReader();
 
-                        const timeout = setTimeout(() => {
-                            self.postMessage({ success: false, error: 'Image load timed out (10s) in worker. File might be too large or corrupted.' });
-                        }, 10000); 
-                        
-                        img.onload = () => {
-                            clearTimeout(timeout); 
-                            try {
-                                const canvas = document.createElement('canvas');
-                                const ctx = canvas.getContext('2d');
-                                
-                                if (!ctx) {
-                                    throw new Error('Could not get canvas context in worker for drawing.');
-                                }
-
-                                const MAX_SIZE = 1000; 
-                                let width = img.width;
-                                let height = img.height;
-
-                                // Resizing logic
-                                if (width > height) {
-                                    if (width > MAX_SIZE) {
-                                        height *= MAX_SIZE / width;
-                                        width = MAX_SIZE;
-                                    }
-                                } else {
-                                    if (height > MAX_SIZE) {
-                                        width *= MAX_SIZE / height;
-                                        height = MAX_SIZE;
-                                    }
-                                }
-
-                                canvas.width = width;
-                                canvas.height = height;
-                                
-                                // Draw image to canvas for compression
-                                ctx.drawImage(img, 0, 0, width, height);
-                                
-                                // Export compressed JPEG
-                                const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
-                                
-                                self.postMessage({ success: true, dataUrl: compressedDataUrl });
-                            } catch (e) {
-                                self.postMessage({ success: false, error: 'Compression/Drawing failed inside worker: ' + e.message });
+                reader.onload = (readerEvent) => {
+                    const img = new Image();
+                    
+                    img.onload = () => {
+                        try {
+                            const canvas = document.createElement('canvas');
+                            const ctx = canvas.getContext('2d');
+                            
+                            if (!ctx) {
+                                return reject(new Error('Could not get canvas context for drawing.'));
                             }
-                        };
-                        
-                        img.onerror = () => {
-                            clearTimeout(timeout); 
-                            self.postMessage({ success: false, error: 'Image failed to load from Object URL in worker. Check file format or corruption.' });
-                        };
-                        
-                        img.src = objectUrl;
+
+                            const MAX_SIZE = 1000; // Max width or height in pixels
+                            let width = img.width;
+                            let height = img.height;
+
+                            // Resizing logic (Scale down to fit MAX_SIZE)
+                            if (width > height) {
+                                if (width > MAX_SIZE) {
+                                    height *= MAX_SIZE / width;
+                                    width = MAX_SIZE;
+                                }
+                            } else {
+                                if (height > MAX_SIZE) {
+                                    width *= MAX_SIZE / height;
+                                    height = MAX_SIZE;
+                                }
+                            }
+
+                            canvas.width = width;
+                            canvas.height = height;
+                            
+                            // Draw image to canvas and compress
+                            ctx.drawImage(img, 0, 0, width, height);
+                            const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
+                            
+                            resolve(compressedDataUrl);
+
+                        } catch (e) {
+                            reject(new Error('Image processing failed during drawing/compression: ' + e.message));
+                        }
                     };
-                `;
-
-                // Worker initialization (using Object URL for the script itself)
-                const blob = new Blob([workerScript], { type: 'application/javascript' });
-                const workerUrl = URL.createObjectURL(blob);
-                const worker = new Worker(workerUrl);
-
-                worker.onmessage = (e) => {
-                    worker.terminate(); 
-                    URL.revokeObjectURL(workerUrl); 
-                    if (e.data.success) {
-                        resolve(e.data.dataUrl);
-                    } else {
-                        reject(e.data.error); 
-                    }
+                    
+                    img.onerror = () => {
+                         reject(new Error('Image failed to load from FileReader result (possibly corrupted).'));
+                    };
+                    
+                    // Start loading the image data
+                    img.src = readerEvent.target.result;
                 };
 
-                worker.onerror = (error) => {
-                    worker.terminate();
-                    URL.revokeObjectURL(workerUrl);
-                    console.error("Worker Execution Error (Top Level):", error);
-                    reject('Worker failed to initialize the compression script.');
-                };
-
-                worker.postMessage({ objectUrl, quality });
+                reader.onerror = (error) => reject(new Error('FileReader failed to read file.'));
+                
+                // Read the file into memory as a Data URL
+                reader.readAsDataURL(file);
             });
         };
 
@@ -250,10 +224,10 @@
 
                 setIsCapturing(true);
                 
-                // --- HEIC/HEIF Check ---
+                // --- HEIC/HEIF Check (Prevents native browser decoding failure) ---
                 if (file.type.toLowerCase().includes('heic') || file.type.toLowerCase().includes('heif')) {
                     window.alert(
-                        "Image format error: This app cannot process HEIC/HEIF files. \n\n" +
+                        "Image format error: This app cannot natively process HEIC/HEIF files. \n\n" +
                         "**Quick Fix on iPhone:** Go to Settings -> Camera -> Formats, and select 'Most Compatible' (JPEG). \n\n" +
                         "Then try capturing the photo again."
                     );
@@ -271,15 +245,11 @@
                     return;
                 }
                 
-                let objectUrl = null;
                 try {
                     const timestamp = new Date().toLocaleString();
                     
-                    // Create Object URL (fast pointer)
-                    objectUrl = URL.createObjectURL(file);
-
-                    // Compress and resize the image (Background Web Worker)
-                    const dataUrl = await compressImageWorker(objectUrl); 
+                    // *** Call the main-thread processing function ***
+                    const dataUrl = await compressImageMainThread(file); 
 
                     const newPhoto = {
                         dataUrl,
@@ -288,13 +258,10 @@
 
                     handleUpdate('photos', [...room.photos, newPhoto]);
                 } catch (error) {
+                    // This error now catches issues in the main-thread canvas processing
                     console.error("Critical Image Processing Error:", error);
-                    window.alert(`Could not process image. Error: ${error}. Try capturing a lower resolution photo.`);
+                    window.alert(`Could not process image. Error: ${error.message}. Try capturing a different photo or check your file type.`);
                 } finally {
-                    // CRITICAL: Revoke the Object URL to free up the memory immediately
-                    if (objectUrl) {
-                        URL.revokeObjectURL(objectUrl);
-                    }
                     setIsCapturing(false);
                     event.target.value = null; // Clear input
                 }
@@ -442,7 +409,7 @@
                                         {isCapturing ? (
                                             <div className="flex items-center">
                                                 <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                                                <span>Compressing Photo...</span>
+                                                <span>Processing Photo...</span>
                                             </div>
                                         ) : (
                                             <>
