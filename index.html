@@ -31,7 +31,6 @@
         }
 
         /* --- PDF PRINT STYLES (Crucial for Print Export) --- */
-        /* These styles activate ONLY when the user prints (or saves as PDF) */
         @media print {
             /* Hide non-essential UI elements for a clean PDF */
             .no-print, header button, .room-card button, .input-group, .add-room-btn { display: none !important; }
@@ -100,7 +99,6 @@
         // Save data to localStorage
         const saveData = (data) => {
             try {
-                // We rely on robust compression to keep sizes manageable.
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
             } catch (error) {
                 console.error("Error saving state to localStorage:", error);
@@ -108,17 +106,21 @@
             }
         };
 
-        // Convert file to Base64 Data URL
+        // Convert file to Base64 Data URL (Improved error handling)
         const fileToBase64 = (file) => {
             return new Promise((resolve, reject) => {
                 const reader = new FileReader();
                 reader.readAsDataURL(file);
                 reader.onload = () => resolve(reader.result);
-                reader.onerror = error => reject(error);
+                reader.onerror = error => {
+                    console.error("FileReader error:", error);
+                    // Return a simple string error to avoid complex, non-extensible objects bubbling up
+                    reject("File reading failed."); 
+                };
             });
         };
 
-        // --- Image Compression Logic (More resilient) ---
+        // --- Image Compression Logic ---
         const compressImage = (base64Data, quality = 0.75) => {
             return new Promise((resolve, reject) => {
                 const img = new Image();
@@ -128,7 +130,6 @@
                         const canvas = document.createElement('canvas');
                         const ctx = canvas.getContext('2d');
                         
-                        // New maximum size (reduced for safety)
                         const MAX_SIZE = 1000; 
                         let width = img.width;
                         let height = img.height;
@@ -151,22 +152,19 @@
                         // Draw image to canvas
                         ctx.drawImage(img, 0, 0, width, height);
                         
-                        // Export compressed JPEG (reduced quality for safety)
+                        // Export compressed JPEG
                         const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
-                        
-                        // Log size for debugging
-                        console.log(`Original image dimensions: ${img.width}x${img.height}. Compressed to: ${width}x${height}. Base64 Length: ${compressedDataUrl.length}`);
                         
                         resolve(compressedDataUrl);
                     } catch (e) {
                         console.error("Internal Compression Error during canvas processing:", e);
-                        reject(new Error("Image compression failed during canvas processing."));
+                        reject("Image compression failed during processing.");
                     }
                 };
                 
                 img.onerror = (e) => {
                     console.error("Image failed to load for compression.", e);
-                    reject(new Error("Image failed to load for compression."));
+                    reject("Image failed to load in browser.");
                 };
                 
                 img.src = base64Data;
@@ -230,7 +228,7 @@
 
                 setIsCapturing(true);
 
-                // Max size check for the raw file before processing (safer limit of 4MB)
+                // Max size check for the raw file before processing (4MB safety limit)
                 const MAX_SIZE_BYTES_RAW = 4 * 1024 * 1024; 
                 if (file.size > MAX_SIZE_BYTES_RAW) {
                     window.alert("Initial photo file too large (over 4MB). Please use a lower resolution photo.");
@@ -257,9 +255,10 @@
 
                     handleUpdate('photos', [...room.photos, newPhoto]);
                 } catch (error) {
-                    // Catch block for compression failure
-                    console.error("Critical Compression Error:", error);
-                    window.alert(`Could not process image: ${error.message || 'Unknown error'}. Try capturing a photo again.`);
+                    // Catch block for any failure in the async chain (fileToBase64 or compressImage)
+                    console.error("Critical Image Processing Error:", error);
+                    // Pass a simplified message to the user
+                    window.alert(`Could not process image: ${typeof error === 'string' ? error : 'A browser error occurred'}. Try capturing a photo again.`);
                 }
 
                 setIsCapturing(false);
@@ -517,8 +516,9 @@
 
                 const roomName = window.prompt("Enter the name of the new room (e.g., Kitchen, Hallway):");
                 if (roomName && roomName.trim()) {
+                    // Using a timestamp + random suffix for robust, unique ID generation (replaces crypto.randomUUID for better compatibility)
                     const newRoom = {
-                        id: crypto.randomUUID(), 
+                        id: Date.now().toString() + '-' + Math.random().toString(36).substring(2, 9), 
                         name: roomName.trim(),
                         notes: [],
                         photos: [] 
@@ -566,12 +566,7 @@
             // --- Export Function ---
             const handlePrintExport = () => {
                 if (selectedProperty) {
-                    // This is the core 'Export to Print/PDF' logic
-                    // 1. Trigger the print dialog
                     window.print();
-                    
-                    // 2. The CSS @media print block automatically formats the content 
-                    //    and hides all the unnecessary 'no-print' UI elements.
                 } else {
                     window.alert("Please select a property to export.");
                 }
